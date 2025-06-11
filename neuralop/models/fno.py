@@ -11,9 +11,15 @@ from ..layers.embeddings import GridEmbeddingND, GridEmbedding2D
 from ..layers.spectral_convolution import SpectralConv
 from ..layers.padding import DomainPadding
 from ..layers.fno_block import FNOBlocks
-from ..layers.channel_mlp import ChannelMLP
+from ..layers.channel_mlp import ChannelMLP, LinearChannelMLP
 from ..layers.complex import ComplexValued
 from .base_model import BaseModel
+from ..losses.fourier_diff import fourier_derivative_1d
+
+torch.set_default_dtype(torch.float64)
+
+from FCPINO1D.hyperparams import *
+
 
 class FNO(BaseModel, name='FNO'):
     """N-Dimensional Fourier Neural Operator. The FNO learns a mapping between
@@ -396,6 +402,251 @@ class FNO(BaseModel, name='FNO'):
     def n_modes(self, n_modes):
         self.fno_blocks.n_modes = n_modes
         self._n_modes = n_modes
+
+class FC_FNO1d(FNO):
+    """1D Fourier Neural Operator
+
+    For the full list of parameters, see :class:`neuralop.models.FNO`.
+
+    Parameters
+    ----------
+    modes_height : int
+        number of Fourier modes to keep along the height
+    """
+
+    def __init__(
+        self,
+        n_modes_height,
+        hidden_channels,
+        in_channels=3,
+        out_channels=1,
+        lifting_channels=256,
+        projection_channels=256,
+        L = int,
+        max_n_modes=None,
+        n_layers=4,
+        resolution_scaling_factor=None,
+        non_linearity=F.gelu,
+        stabilizer=None,
+        complex_data=False,
+        fno_block_precision="full",
+        channel_mlp_dropout=0,
+        channel_mlp_expansion=0.5,
+        norm=None,
+        skip="soft-gating",
+        separable=False,
+        preactivation=False,
+        factorization=None,
+        rank=1.0,
+        fixed_rank_modes=False,
+        implementation="factorized",
+        decomposition_kwargs=dict(),
+        domain_padding=None,
+        domain_padding_mode="symmetric",
+        **kwargs
+    ):
+        super().__init__(
+            n_modes=(n_modes_height,),
+            hidden_channels=hidden_channels,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            lifting_channels=lifting_channels,
+            projection_channels=projection_channels,
+            n_layers=n_layers,
+            resolution_scaling_factor=resolution_scaling_factor,
+            non_linearity=non_linearity,
+            stabilizer=stabilizer,
+            complex_data=complex_data,
+            fno_block_precision=fno_block_precision,
+            channel_mlp_dropout=channel_mlp_dropout,
+            channel_mlp_expansion=channel_mlp_expansion,
+            max_n_modes=max_n_modes,
+            norm=norm,
+            skip=skip,
+            separable=separable,
+            preactivation=preactivation,
+            factorization=factorization,
+            rank=rank,
+            fixed_rank_modes=fixed_rank_modes,
+            implementation=implementation,
+            decomposition_kwargs=decomposition_kwargs,
+            domain_padding=domain_padding,
+            domain_padding_mode=domain_padding_mode,
+            L = L,
+        )
+        self.n_modes_height = n_modes_height
+        self.L = L
+    
+        self.projection = LinearChannelMLP(
+            layers=[hidden_channels, projection_channels, out_channels],
+            non_linearity=non_linearity,
+        )
+
+     
+
+        """proj_hidden = projection_channels 
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_channels, proj_hidden),  # 1
+            nn.GELU(),                                # ┐
+            nn.Linear(proj_hidden, proj_hidden),      # │ first three
+            nn.GELU(),                                # │   GELU
+            nn.Linear(proj_hidden, proj_hidden),      # │ activations
+            nn.GELU(),                                # ┘
+            nn.Linear(proj_hidden, out_channels),     # 4th linear
+            nn.Tanh()                                 # final tanh
+        )"""
+
+    def dQ(self, X1, DX_arr, num_derivs, Q1, Q2):
+
+        """Chain rule of model, call it Q, to compute dQ/d(inputs)"""
+
+        DX = DX_arr[0]           # (b, i, x)
+        D2X = DX_arr[1] if num_derivs == 2 else None
+
+        X1 = X1.permute(0, 2, 1)  # (b, m, x)
+        b, m, x = X1.shape
+        i = Q1.weight.shape[1]    # input dim of Q1
+        o = Q2.weight.shape[1]    # output dim (often 1)
+
+        DW1 = Q1.weight           # (m, i)
+        DW1 = DW1.squeeze(-1)
+        DW2 = Q2.weight.reshape(m, 1)  # (m, 1)
+
+
+        #act = self.non_linearity(X1)
+
+        #D_act = fourier_derivative_1d(act, order = 1, L = self.L, use_FC=True)
+
+        Dtanh = 1 / torch.cosh(X1)**2     # (b, m, x)
+
+        W = (DW1 * DW2).T   # (i, m)
+
+
+        DQ = torch.matmul(W.unsqueeze(0), Dtanh)  # (1, i, m) @ (b, m, x) => (b, i, x)
+
+        DX_out = (DQ * DX).sum(dim=1)  # (b, x)
+
+
+        
+        #DQ = torch.einsum("mi,bmx->bix", DW1 * DW2, Dtanh)
+        #DX_out = torch.einsum("bix,bix->bx", DQ, DX)  # (b, x)
+
+        if num_derivs == 1:
+            return DX_out
+
+        # Second derivative
+        #Htanh = -2 * D_act * torch.tanh(X1)  # (b, m, x)
+        #H_deriv = fourier_derivative_1d(act, order = 2, L = self.L, use_FC=True)
+       
+        Htanh = -2*Dtanh*torch.tanh(X1)
+
+        H2 = DW2.reshape(1, m, 1) * Htanh    # (b, m, x)
+
+        # Compute D2Q1 = d/dx^2 (Q2(tanh(Q1(x))))
+        D2X_1 = (torch.matmul(DW1, DX) * H2 * torch.matmul(DW1, DX)).sum(dim=1)
+        D2X_2 = (DQ * D2X).sum(dim=1)
+        #D2X_1 = torch.einsum("bix,mi,bmx,mj,bjx->bx", DX, DW1, H2, DW1, DX)
+        #D2X_2 = torch.einsum("bix,bix->bx", DQ, D2X)
+
+        D2X_out = D2X_1 + D2X_2
+        return DX_out, D2X_out
+
+
+
+
+    def forward(self, x, output_shape=None, **kwargs):
+            """FNO's forward pass
+            
+            1. Applies optional positional encoding
+
+            2. Sends inputs through a lifting layer to a high-dimensional latent space
+
+            3. Applies optional domain padding to high-dimensional intermediate function representation
+
+            4. Applies `n_layers` Fourier/FNO layers in sequence (SpectralConvolution + skip connections, nonlinearity) 
+
+            5. If domain padding was applied, domain padding is removed
+
+            6. Projection of intermediate function representation to the output channels
+
+            Parameters
+            ----------
+            x : tensor
+                input tensor
+            
+            output_shape : {tuple, tuple list, None}, default is None
+                Gives the option of specifying the exact output shape for odd shaped inputs.
+                
+                * If None, don't specify an output shape
+
+                * If tuple, specifies the output-shape of the **last** FNO Block
+
+                * If tuple list, specifies the exact output-shape of each FNO Block
+            """
+
+            if output_shape is None:
+                output_shape = [None]*self.n_layers
+            elif isinstance(output_shape, tuple):
+                output_shape = [None]*(self.n_layers - 1) + [output_shape]
+
+            # append spatial pos embedding if set
+            if self.positional_embedding is not None:
+                x = self.positional_embedding(x)
+            
+            x = self.lifting(x)
+
+            if self.domain_padding is not None:
+                x = self.domain_padding.pad(x)
+
+            for layer_idx in range(self.n_layers):
+                x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
+
+            if self.domain_padding is not None:
+                x = self.domain_padding.unpad(x)
+
+        
+            #print(x.shape)
+            x1 = CONTINUATION_FUNC(x)
+            #print(x1.shape)
+            dx = fourier_derivative_1d(x1, order = 1, L = self.L * (400+CONTINUATION_GRIDPOINTS)/400)
+            dxx = fourier_derivative_1d(x1, order = 2, L = self.L * (400+CONTINUATION_GRIDPOINTS)/400)
+            #dx = fourier_derivative_1d(x, order = 1, L = self.L, use_FC=True, FC_n=4, FC_d=20) ## dg/dx
+            #dxx = fourier_derivative_1d(x, order = 2, L = self.L, use_FC=True, FC_n=4, FC_d=20)#, low_pass_filter_ratio = 0.85)
+
+            dx = dx[..., :-CONTINUATION_GRIDPOINTS]
+            dxx = dxx[..., :-CONTINUATION_GRIDPOINTS]
+            #print('dx and dxx shape before slice', dx.shape, dxx.shape)
+            #dx = dx[:, :256, :]
+            #dxx = dxx[:, :256, :]
+
+            #print('dx shape ', dx.shape)
+            #print('dxx shape ', dxx.shape)
+
+
+            Dx_arr = (dx, dxx)
+
+            Q1 = self.projection.fcs[0]  # first Linear layer
+            Q2 = self.projection.fcs[1]  # second Linear layer (output)
+            #Q1 = self.projection[0]   
+            #Q2 = self.projection[6]     
+
+            
+            #print('before transpose x shape', x.shape)
+            #print('before transpose x shape', x.transpose(1,2).shape)
+            #print("Q1.in_features:", Q1.in_features)   
+
+
+            X1 = Q1(x.transpose(1,2))
+            
+            Dx_arr = self.dQ(X1, Dx_arr, 2, Q1, Q2)
+            
+            x = self.projection(x.transpose(1,2))
+
+            #x = torch.tanh(x)
+         
+            x = x.transpose(1,2)
+
+            return x.squeeze(), Dx_arr[0].squeeze(), *[deriv.squeeze() for deriv in Dx_arr[1:]]
 
 
 class FNO1d(FNO):

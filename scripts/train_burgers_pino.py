@@ -4,26 +4,25 @@ import wandb
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 
-from neuralop import H1Loss, LpLoss, BurgersEqnLoss, ICLoss, WeightedSumLoss, Trainer, get_model
+from neuralop import H1Loss, LpLoss, BurgersEqnLoss, ICLoss, get_model
 from neuralop.data.datasets import load_mini_burgers_1dtime
 from neuralop.data.transforms.data_processors import MGPatchingDataProcessor
-from neuralop.training import setup, AdamW
+from neuralop.training import setup, AdamW, PINOTrainer
 from neuralop.utils import get_wandb_api_key, count_model_params, get_project_root
+from neuralop.losses.meta_losses import Relobralo_for_Trainer, SoftAdapt_for_Trainer
 
 
 # Read the configuration
 config_name = "default"
-# Read the configuration
-from zencfg import cfg_from_commandline, cfg_from_nested_dict
+from zencfg import cfg_from_commandline
 import sys 
 sys.path.insert(0, '../')
-from config.burgers_config import Default
-
+from config.burgers_pino_config import Default
 
 config = cfg_from_commandline(Default)
 config = config.to_dict()
 
-# Set-up distributed communication, if using
+# Set-up distributed communication
 device, is_logger = setup(config)
 
 # Set up WandB logging
@@ -55,7 +54,7 @@ if config.wandb.log and is_logger:
     wandb.init(**wandb_init_args)
 else: 
     wandb_init_args = None
-# Make sure we only print information when needed
+
 config.verbose = config.verbose and is_logger
 
 # Print config to screen
@@ -88,6 +87,7 @@ optimizer = AdamW(
     weight_decay=config.opt.weight_decay,
 )
 
+# Create the scheduler
 if config.opt.scheduler == "ReduceLROnPlateau":
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -106,7 +106,6 @@ elif config.opt.scheduler == "StepLR":
 else:
     raise ValueError(f"Got scheduler={config.opt.scheduler}")
 
-
 # Creating the losses
 l2loss = LpLoss(d=2, p=2)
 h1loss = H1Loss(d=2)
@@ -118,28 +117,32 @@ training_loss = config.opt.training_loss
 if not isinstance(training_loss, (tuple, list)):
     training_loss = [training_loss]
 
-losses = []
-weights = []
-for loss in training_loss:
-    # Append loss
+losses = {}
+mappings = {}
+for i, loss in enumerate(training_loss):
+    # Add loss
     if loss == 'l2':
-        losses.append(l2loss)
+        losses[f'l2_{i}'] = l2loss
     elif loss == 'h1':
-        losses.append(h1loss)
+        losses[f'h1_{i}'] = h1loss
     elif loss == 'equation':
-        losses.append(equation_loss)
+        losses[f'equation_{i}'] = equation_loss
     elif loss == 'ic':
-        losses.append(ic_loss)
+        losses[f'ic_{i}'] = ic_loss
     else:
         raise ValueError(f'Training_loss={loss} is not supported.')
+    # Add mapping (here assumes each loss operates on the full output)
+    mappings[f'{loss}_{i}'] = slice(None)
 
-    # Append loss weight
-    if "loss_weights" in config.opt:
-        weights.append(config.opt.loss_weights.get(loss, 1.))
-    else:
-        weights.append(1.)
+# Select loss aggregator
+agg = config.opt.loss_aggregator.lower()
+if agg == 'relobralo':
+    train_loss = Relobralo_for_Trainer(losses=losses, mappings=mappings, alpha=0.5, beta=0.9, tau=1.0)
+elif agg == 'softadapt':
+    train_loss = SoftAdapt_for_Trainer(losses=losses, mappings=mappings)
+else:
+    raise ValueError(f"Unknown loss_aggregator: {agg}. Use 'relobralo' or 'softadapt'.")
 
-train_loss = WeightedSumLoss(losses=losses, weights=weights)
 eval_losses = {"h1": h1loss, "l2": l2loss}
 
 if config.verbose:
@@ -162,7 +165,7 @@ if config.patching.levels > 0:
                                         in_normalizer=data_processor.in_normalizer,
                                         out_normalizer=data_processor.out_normalizer)
 
-trainer = Trainer(
+trainer = PINOTrainer(
     model=model,
     n_epochs=config.opt.n_epochs,
     data_processor=data_processor,
@@ -175,7 +178,7 @@ trainer = Trainer(
     wandb_log = config.wandb.log
 )
 
-# Log parameter count
+# Log number of parameters
 if is_logger:
     n_params = count_model_params(model)
 
@@ -204,4 +207,4 @@ trainer.train(
 )
 
 if config.wandb.log and is_logger:
-    wandb.finish()
+    wandb.finish() 

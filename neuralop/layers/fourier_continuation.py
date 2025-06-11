@@ -3,9 +3,8 @@ import torch.nn as nn
 import numpy as np
 from numpy.polynomial.legendre import Legendre
 
-
 class FCLegendre(nn.Module):
-    def __init__(self, n, d, dtype=torch.float32):
+    def __init__(self, n, d, dtype=torch.float64):
         super().__init__()
 
         self.dtype = dtype
@@ -41,7 +40,7 @@ class FCLegendre(nn.Module):
         #Compute extension matrix
         ext_mat = np.matmul(Q, np.linalg.pinv(X, rcond=1e-31))
         self.register_buffer('ext_mat', torch.from_numpy(ext_mat).to(dtype=self.dtype))
-        self.register_buffer('ext_mat_T', self.ext_mat.T.clone())
+        self.register_buffer('ext_mat_T', self.ext_mat.T.clone().to(dtype=self.dtype))
 
         return self.ext_mat
 

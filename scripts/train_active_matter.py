@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 import wandb
 
 from neuralop import H1Loss, LpLoss, Trainer, get_model
-from neuralop.data.datasets.the_well import ActiveMatterDataset
+from neuralop.data.datasets.the_well_dataset import ActiveMatterDataset
 from neuralop.data.transforms.data_processors import MGPatchingDataProcessor
 from neuralop.training import setup, AdamW
 from neuralop.mpu.comm import get_local_rank
@@ -43,14 +43,10 @@ if config.wandb.log and is_logger:
             f"{var}"
             for var in [
                 config_name,
-                config.fno.n_layers,
-                config.fno.hidden_channels,
-                config.fno.n_modes_width,
-                config.fno.n_modes[0],
-                config.fno.factorization,
-                config.fno.rank,
-                config.patching.levels,
-                config.patching.padding,
+                config.model.model_arch,
+                config.model.n_layers,
+                config.model.n_modes,
+                config.model.hidden_channels,
             ]
         )
     wandb_args =  dict(
