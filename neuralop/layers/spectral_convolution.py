@@ -17,6 +17,8 @@ tl.set_backend("pytorch")
 use_opt_einsum("optimal")
 einsum_symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+torch.set_default_dtype(torch.float64)
+
 
 def _contract_dense(x, weight, separable=False):
     order = tl.ndim(x)
@@ -342,7 +344,7 @@ class SpectralConv(BaseSpectralConv):
         else:
             self.weight = FactorizedTensor.new(weight_shape, rank=self.rank, 
                                      factorization=factorization, fixed_rank_modes=fixed_rank_modes,
-                                     **tensor_kwargs, dtype=torch.cfloat) 
+                                     **tensor_kwargs, dtype=torch.cdouble)#dtype=torch.cfloat) 
         self.weight.normal_(0, init_std)
         
         self._contract = get_contract_fun(

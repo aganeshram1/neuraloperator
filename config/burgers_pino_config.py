@@ -22,7 +22,7 @@ class BurgersDatasetConfig(ConfigBase):
 
 class BurgersOptConfig(OptimizationConfig):
     n_epochs: int = 10000
-    training_loss: List[str] = ["equation", "ic", "l2"] # ["equation", "l2"... or "ic"...]
+    training_loss: List[str] = [ "equation", "ic", "data"] # ["equation", "l2"... or "ic"...]
     testing_loss: str = "l2"
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
