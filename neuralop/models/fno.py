@@ -14,11 +14,66 @@ from ..layers.fno_block import FNOBlocks
 from ..layers.channel_mlp import ChannelMLP, LinearChannelMLP
 from ..layers.complex import ComplexValued
 from .base_model import BaseModel
-from ..losses.fourier_diff import fourier_derivative_1d
+from ..losses.fourier_diff import fourier_derivative_1d, laplacian_3D, fourier_derivative_1d_128
 
 torch.set_default_dtype(torch.float64)
 
-from FCPINO1D.hyperparams import *
+#from FCPINO1D.hyperparams import *
+#from FCPINO1D.isolated_utils import FC1d_2d
+
+
+
+#fc1 = nn.Linear(100, 256)
+#fc2 = nn.Linear(256, 1)
+
+
+class SpectralConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, use_FC, return_full=False):
+        super(SpectralConv1d, self).__init__()
+
+        """
+        1D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
+        """
+
+        self.use_FC = use_FC
+        self.return_full = return_full
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1  # Number of Fourier modes to multiply, at most floor(N/2) + 1
+
+        self.scale = (1 / (in_channels * out_channels))
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, 2, dtype=torch.double))
+
+    # Complex multiplication
+    def compl_mul1d(self, input, weights):
+        # (batch, in_channel, x ), (in_channel, out_channel, x) -> (batch, out_channel, x)
+        return torch.einsum("bix,iox->box", input, weights)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        # Compute Fourier coeffcients up to factor of e^(- something constant)
+        # 
+
+        if self.use_FC: 
+            x = CONTINUATION_FUNC(x)
+        x_ft = torch.fft.rfft(x)
+
+        # Multiply relevant Fourier modes
+        out_ft = torch.zeros(batchsize, self.out_channels, x.size(-1) // 2 + 1, device=x.device, dtype=torch.cdouble)
+        out_ft[:, :, :self.modes1] = self.compl_mul1d(x_ft[:, :, :self.modes1], torch.view_as_complex(self.weights1))
+
+        # Return to physical space
+        x = torch.fft.irfft(out_ft, n=x.size(-1))
+
+        if self.return_full:
+            return x[..., :-CONTINUATION_GRIDPOINTS], x
+        elif self.use_FC:
+            return x[..., :-CONTINUATION_GRIDPOINTS]
+        else:
+            return x
+
 
 
 class FNO(BaseModel, name='FNO'):
@@ -404,7 +459,26 @@ class FNO(BaseModel, name='FNO'):
         self._n_modes = n_modes
 
 class FC_FNO1d(FNO):
-    """1D Fourier Neural Operator
+    """1D FC-FNO.
+
+    You can apply FC either at the beginning or the end of the model or outisde the model.
+
+    Beginning FC is applied before the inital lifiting layer. 
+
+    End FC is right before the last projection layer using the multivariable chain rule. This is just a means to compute derivatives.
+
+    Outside FC is applied after the last projection layer. This is again just a means to compute derivatives.
+
+    ** THERE ARE UN NEEDED PARAMETERS IN THIS CLASS. WILL BE FIXED IN THE FUTURE. **
+    
+    The where_restriction and where_projection parameters are used to specify the location of the FC function. 
+
+    This was being tested, and the best were obtained when we applied the FC function before the lifting layer and 
+    after the projection layer. 
+
+    This will be defualt in the future. 
+
+
 
     For the full list of parameters, see :class:`neuralop.models.FNO`.
 
@@ -412,6 +486,14 @@ class FC_FNO1d(FNO):
     ----------
     modes_height : int
         number of Fourier modes to keep along the height
+        FC_type: str
+            'beginning': FC is applied before the inital lifiting layer. 
+            'end': FC is applied right before the last projection layer using the multivariable chain rule. This is just a means to compute derivatives.
+            'outside': FC is applied after the last projection layer. This is again just a means to compute derivatives.
+        FC_func: function
+            FC function to apply.
+        cont_points: int
+            number of points to use for the continuous part of the domain.
     """
 
     def __init__(
@@ -422,6 +504,9 @@ class FC_FNO1d(FNO):
         out_channels=1,
         lifting_channels=256,
         projection_channels=256,
+        FC_location = str,
+        where_restriction = str,
+        where_projection = str,
         L = int,
         max_n_modes=None,
         n_layers=4,
@@ -443,6 +528,13 @@ class FC_FNO1d(FNO):
         decomposition_kwargs=dict(),
         domain_padding=None,
         domain_padding_mode="symmetric",
+        conv_module: nn.Module=SpectralConv,
+        grid_points=None,
+        FC_func=None,
+        FC_type=None,
+        cont_points = None,
+        one_sided = None,
+        fourier_diff = None,
         **kwargs
     ):
         super().__init__(
@@ -462,7 +554,7 @@ class FC_FNO1d(FNO):
             channel_mlp_expansion=channel_mlp_expansion,
             max_n_modes=max_n_modes,
             norm=norm,
-            skip=skip,
+            skip=None,
             separable=separable,
             preactivation=preactivation,
             factorization=factorization,
@@ -473,49 +565,108 @@ class FC_FNO1d(FNO):
             domain_padding=domain_padding,
             domain_padding_mode=domain_padding_mode,
             L = L,
-        )
+            grid_points = grid_points,
+            FC_func=FC_func,
+            FC_type=FC_type,
+            cont_points = cont_points,
+            fourier_diff = fourier_diff,
+            one_sided = one_sided,
+            FC_location = FC_location,
+            where_restriction = where_restriction,
+            where_projection = where_projection)
+        
+
+        """self.fno_blocks_fc = FNOBlocks(
+            in_channels=hidden_channels,
+            out_channels=hidden_channels,
+            n_modes=self.n_modes,
+            resolution_scaling_factor=resolution_scaling_factor,
+            channel_mlp_dropout=channel_mlp_dropout,
+            channel_mlp_expansion=channel_mlp_expansion,
+            non_linearity=non_linearity,
+            stabilizer=stabilizer,
+            norm=norm,
+            preactivation=preactivation,
+            complex_data=complex_data,
+            max_n_modes=max_n_modes,
+            fno_block_precision=fno_block_precision,
+            rank=rank,
+            fixed_rank_modes=fixed_rank_modes,
+            implementation=implementation,
+            separable=separable,
+            factorization=factorization,
+            decomposition_kwargs=decomposition_kwargs,
+            conv_module=conv_module,
+            n_layers=n_layers,
+            FC_func=FC_func,
+            FC_type=FC_type,
+            cont_points = cont_points,
+            one_sided = one_sided,
+            **kwargs
+        )"""
+
         self.n_modes_height = n_modes_height
+        self.FC_location = FC_location
+
+
+
         self.L = L
+        self.grid_points = grid_points
+        self.FC_func=FC_func
+        self.FC_type=FC_type
+        self.cont_points = cont_points
+        self.one_sided = one_sided
+        self.fourier_diff = fourier_diff
+        self.where_restriction = where_restriction
+        self.where_projection = where_projection
     
+        
         self.projection = LinearChannelMLP(
             layers=[hidden_channels, projection_channels, out_channels],
             non_linearity=non_linearity,
         )
-
-     
-
-        """proj_hidden = projection_channels 
-        self.projection = nn.Sequential(
-            nn.Linear(hidden_channels, proj_hidden),  # 1
-            nn.GELU(),                                # ┐
-            nn.Linear(proj_hidden, proj_hidden),      # │ first three
-            nn.GELU(),                                # │   GELU
-            nn.Linear(proj_hidden, proj_hidden),      # │ activations
-            nn.GELU(),                                # ┘
-            nn.Linear(proj_hidden, out_channels),     # 4th linear
-            nn.Tanh()                                 # final tanh
-        )"""
-
+    
     def dQ(self, X1, DX_arr, num_derivs, Q1, Q2):
 
-        """Chain rule of model, call it Q, to compute dQ/d(inputs)"""
+        """
+        
+        Chain rule of model, call it Q, to compute dQ/d(inputs). Uses einsum for efficiency. 
 
+        ***** Assumes that the final nonlinearity is tanh. ******
+        
+        Gradient chain rule: D(f o g) = D(f(g)) o Dg
+        
+        Hessian chain rule: D2(f o g) = D2(f(g)) o Dg^2 + D(f(g)) o D2g
+
+        As implemented, Q1 is the first projection layer of the model, and Q2 is the last projection layer.         
+        
+        Also as implemented, this works up to the second derivative in the 1-D case.
+
+        You can generalize this to higher dimensions by using the chain rule for higher derivatives. 
+      
+        In the 3rd derivative case, the  chain rule is:
+        D3(f o g) = D3(f(g)) o Dg^3 + 3 * D2(f(g)) o Dg * D2g + D(f(g)) o D3g
+        
+        In the general case, the chain rule is:
+        D^n(f o g) = summation(k=0 to n-1) (n-1 choose k) * D^(k+1)g(x)D^(n-k)(f'(g(x)))
+
+        see https://math.stackexchange.com/questions/4046174/nth-derivative-with-chain-rule for more details. 
+        
+        """
+        
         DX = DX_arr[0]           # (b, i, x)
         D2X = DX_arr[1] if num_derivs == 2 else None
+
+
 
         X1 = X1.permute(0, 2, 1)  # (b, m, x)
         b, m, x = X1.shape
         i = Q1.weight.shape[1]    # input dim of Q1
-        o = Q2.weight.shape[1]    # output dim (often 1)
+        o = Q2.weight.shape[1]    # output dim 
 
         DW1 = Q1.weight           # (m, i)
         DW1 = DW1.squeeze(-1)
         DW2 = Q2.weight.reshape(m, 1)  # (m, 1)
-
-
-        #act = self.non_linearity(X1)
-
-        #D_act = fourier_derivative_1d(act, order = 1, L = self.L, use_FC=True)
 
         Dtanh = 1 / torch.cosh(X1)**2     # (b, m, x)
 
@@ -536,7 +687,7 @@ class FC_FNO1d(FNO):
 
         # Second derivative
         #Htanh = -2 * D_act * torch.tanh(X1)  # (b, m, x)
-        #H_deriv = fourier_derivative_1d(act, order = 2, L = self.L, use_FC=True)
+        #H_deriv = fourier_derivative_1d(act, order = 2, L = self.L, FC_func=True)
        
         Htanh = -2*Dtanh*torch.tanh(X1)
 
@@ -591,10 +742,16 @@ class FC_FNO1d(FNO):
 
             # append spatial pos embedding if set
             if self.positional_embedding is not None:
-                x = self.positional_embedding(x)
+                x = self.positional_embedding(x) 
+
+            if self.FC_type == 'beginning' and self.where_projection == 'before':
+                x = self.FC_func(x)
             
             x = self.lifting(x)
 
+            if self.FC_type == 'beginning' and self.where_projection == 'after':
+                x = self.FC_func(x)
+            
             if self.domain_padding is not None:
                 x = self.domain_padding.pad(x)
 
@@ -604,50 +761,962 @@ class FC_FNO1d(FNO):
             if self.domain_padding is not None:
                 x = self.domain_padding.unpad(x)
 
-        
-            #print(x.shape)
-            x1 = CONTINUATION_FUNC(x)
-            #print(x1.shape)
-            dx = fourier_derivative_1d(x1, order = 1, L = self.L * (400+CONTINUATION_GRIDPOINTS)/400)
-            dxx = fourier_derivative_1d(x1, order = 2, L = self.L * (400+CONTINUATION_GRIDPOINTS)/400)
-            #dx = fourier_derivative_1d(x, order = 1, L = self.L, use_FC=True, FC_n=4, FC_d=20) ## dg/dx
-            #dxx = fourier_derivative_1d(x, order = 2, L = self.L, use_FC=True, FC_n=4, FC_d=20)#, low_pass_filter_ratio = 0.85)
+            
+            if self.FC_type == 'end':
+                x1 = self.FC_func(x)
+            elif self.FC_type == 'beginning':
+                x1 = x
 
-            dx = dx[..., :-CONTINUATION_GRIDPOINTS]
-            dxx = dxx[..., :-CONTINUATION_GRIDPOINTS]
-            #print('dx and dxx shape before slice', dx.shape, dxx.shape)
-            #dx = dx[:, :256, :]
-            #dxx = dxx[:, :256, :]
+ 
+            if self.fourier_diff and (self.FC_type == 'end' or self.FC_type == 'beginning'):
+                dx = fourier_derivative_1d(x1, order = 1, L = self.L * (self.grid_points+self.cont_points)/self.grid_points)
+                dxx = fourier_derivative_1d(x1, order = 2, L = self.L * (self.grid_points+self.cont_points)/self.grid_points)
+                if self.one_sided:
+                    dx = dx[..., :-self.cont_points]
+                    dxx = dxx[..., :-self.cont_points]
+                else:
+                    dx = dx[..., self.cont_points//2:-self.cont_points//2]
+                    dxx = dxx[..., self.cont_points//2:-self.cont_points//2]
 
-            #print('dx shape ', dx.shape)
-            #print('dxx shape ', dxx.shape)
+
+                Dx_arr = (dx, dxx)
+
+                Q1 = self.projection.fcs[0]  # first Linear layer
+                Q2 = self.projection.fcs[-1]
 
 
-            Dx_arr = (dx, dxx)
 
-            Q1 = self.projection.fcs[0]  # first Linear layer
-            Q2 = self.projection.fcs[1]  # second Linear layer (output)
-            #Q1 = self.projection[0]   
-            #Q2 = self.projection[6]     
+
+                if self.FC_type == 'beginning': 
+                    if self.one_sided:
+                        x1 = x[..., :-self.cont_points]
+                else:
+                    x1 = x 
+
+                if self.where_restriction == 'before':
+                    x = x[..., :-self.cont_points]
+                #print(x1.shape)
+                #print(x1.transpose(1,2).shape)
+                X1 = Q1(x1.transpose(1,2))
+
+                Dx_arr = self.dQ(X1, Dx_arr, 2, Q1, Q2)
+                
+                x = self.projection(x.transpose(1,2))
+            
+                x = x.transpose(1,2)
+
+                if self.where_restriction == 'after':
+                    x = x[..., :-self.cont_points]
+            
+            if self.FC_type == 'outside':
+                x = self.projection(x.transpose(1,2))
+                x1 = self.FC_func(x)
+                dx = fourier_derivative_1d(x1, order = 1, L = self.L * (self.grid_points+self.cont_points)/self.grid_points)
+                dxx = fourier_derivative_1d(x1, order = 2, L = self.L * (self.grid_points+self.cont_points)/self.grid_points)
+                if self.one_sided:
+                    dx = dx[..., :-self.cont_points]
+                    dxx = dxx[..., :-self.cont_points]
+                else:
+                    dx = dx[..., self.cont_points//2:-self.cont_points//2]
+                    dxx = dxx[..., self.cont_points//2:-self.cont_points//2]
+
+                Dx_arr = (dx, dxx)
 
             
-            #print('before transpose x shape', x.shape)
-            #print('before transpose x shape', x.transpose(1,2).shape)
-            #print("Q1.in_features:", Q1.in_features)   
-
-
-            X1 = Q1(x.transpose(1,2))
-            
-            Dx_arr = self.dQ(X1, Dx_arr, 2, Q1, Q2)
-            
-            x = self.projection(x.transpose(1,2))
-
-            #x = torch.tanh(x)
-         
-            x = x.transpose(1,2)
-
             return x.squeeze(), Dx_arr[0].squeeze(), *[deriv.squeeze() for deriv in Dx_arr[1:]]
 
+
+class FC_FNO2d(FNO):
+    """2D Fourier Neural Operator. As implemented, the FC_FNO2d works for the 2D Burgers equation. 
+
+     ** THERE ARE UN NEEDED PARAMETERS IN THIS CLASS. WILL BE FIXED IN THE FUTURE. **
+    
+    Will be generalized to other PDEs in the future.
+
+
+    For the full list of parameters, see :class:`neuralop.models.FNO`.
+
+    Parameters
+    ----------
+    n_modes_height : int
+        number of Fourier modes to keep along the height
+    n_modes_width : int
+        number of Fourier modes to keep along the width
+    FC_type: str
+        'beginning': FC is applied before the inital lifiting layer. 
+        'end': FC is applied right before the last projection layer using the multivariable chain rule. This is just a means to compute derivatives.
+        'outside': FC is applied after the last projection layer. This is again just a means to compute derivatives.
+    FC_func: function
+        FC function to apply. Assumes it extends the function in 2D
+    cont_points: int
+        number of points to use for the continuous part of the domain.
+    """
+
+    def __init__(
+        self,
+        n_modes_height,
+        n_modes_width,
+        hidden_channels,
+        in_channels=3,
+        out_channels=1,
+        lifting_channels=256,
+        projection_channels=256,
+        FC_location = str,
+        Lx = int,
+        Ly = int,
+        max_n_modes=None,
+        n_layers=4,
+        resolution_scaling_factor=None,
+        non_linearity=F.gelu,
+        stabilizer=None,
+        complex_data=False,
+        fno_block_precision="full",
+        channel_mlp_dropout=0,
+        channel_mlp_expansion=0.5,
+        norm=None,
+        skip="soft-gating",
+        separable=False,
+        preactivation=False,
+        factorization=None,
+        rank=1.0,
+        fixed_rank_modes=False,
+        implementation="factorized",
+        decomposition_kwargs=dict(),
+        domain_padding=None,
+        domain_padding_mode="symmetric",
+        conv_module: nn.Module=SpectralConv,
+        x_second_deriv = None,
+        y_second_deriv = None,
+        x_res = None,
+        y_res = None,
+        FC_func=None,   
+        FC_type=None,
+        cont_points = None,
+        one_sided = None,
+        fourier_diff = None,
+        **kwargs
+    ):
+        super().__init__(
+            n_modes=(n_modes_height, n_modes_width),
+            hidden_channels=hidden_channels,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            lifting_channels=lifting_channels,
+            projection_channels=projection_channels,
+            n_layers=n_layers,
+            resolution_scaling_factor=resolution_scaling_factor,
+            non_linearity=non_linearity,
+            stabilizer=stabilizer,
+            complex_data=complex_data,
+            fno_block_precision=fno_block_precision,
+            channel_mlp_dropout=channel_mlp_dropout,
+            channel_mlp_expansion=channel_mlp_expansion,
+            max_n_modes=max_n_modes,
+            norm=norm,
+            skip=None,
+            separable=separable,
+            preactivation=preactivation,
+            factorization=factorization,
+            rank=rank,
+            fixed_rank_modes=fixed_rank_modes,
+            implementation=implementation,
+            decomposition_kwargs=decomposition_kwargs,
+            domain_padding=domain_padding,
+            domain_padding_mode=domain_padding_mode,
+            Lx = Lx,
+            Ly = Ly,
+            FC_func=FC_func,
+            FC_type=FC_type,
+            cont_points = cont_points,
+            fourier_diff = fourier_diff,
+            one_sided = one_sided,
+            x_second_deriv = x_second_deriv,
+            x_res = x_res,
+            y_res = y_res,
+            y_second_deriv = y_second_deriv)
+        
+
+        """self.fno_blocks_fc = FNOBlocks(
+            in_channels=hidden_channels,
+            out_channels=hidden_channels,
+            n_modes=self.n_modes,
+            resolution_scaling_factor=resolution_scaling_factor,
+            channel_mlp_dropout=channel_mlp_dropout,
+            channel_mlp_expansion=channel_mlp_expansion,
+            non_linearity=non_linearity,
+            stabilizer=stabilizer,
+            norm=norm,
+            preactivation=preactivation,
+            complex_data=complex_data,
+            max_n_modes=max_n_modes,
+            fno_block_precision=fno_block_precision,
+            rank=rank,
+            fixed_rank_modes=fixed_rank_modes,
+            implementation=implementation,
+            separable=separable,
+            factorization=factorization,
+            decomposition_kwargs=decomposition_kwargs,
+            conv_module=conv_module,
+            n_layers=n_layers,
+            FC_func=FC_func,
+            FC_type=FC_type,
+            cont_points = cont_points,
+            one_sided = one_sided,
+            **kwargs
+        )"""
+
+        self.n_modes_height = n_modes_height
+        self.n_modes_width = n_modes_width
+        self.FC_location = FC_location
+
+
+
+        self.Lx = Lx
+        self.Ly = Ly
+        self.FC_func=FC_func
+        self.FC_type=FC_type
+        self.cont_points = cont_points
+        self.one_sided = one_sided
+        self.fourier_diff = fourier_diff
+        self.x_res = x_res
+        self.y_res = y_res
+        self.x_second_deriv = x_second_deriv
+        self.y_second_deriv = y_second_deriv
+        
+        self.projection = LinearChannelMLP(
+            layers=[hidden_channels, projection_channels, out_channels],
+            non_linearity=non_linearity,
+        )
+    
+    def dQ_2D(self, X1, DX_arr, x_second_deriv, y_second_deriv, Q1, Q2):
+        """
+        
+        Chain rule of model, call it Q, to compute dQ/d(inputs). Uses einsum for efficiency. 
+
+        ***** Assumes that the final nonlinearity is tanh. ******
+        
+        Gradient chain rule: D(f o g) = D(f(g)) o Dg
+        
+        Hessian chain rule: D2(f o g) = D2(f(g)) o Dg^2 + D(f(g)) o D2g
+
+        As implemented, Q1 is the first projection layer of the model, and Q2 is the last projection layer.         
+        
+        Also as implemented, this works up for the derivatives in the 2-D Burgers equation. 
+        In future, this will be generalized and more robust for any PDE
+
+        You can generalize this to higher dimensions by using the chain rule for higher derivatives. 
+      
+        In the 3rd derivative case, the chain rule is:
+        D3(f o g) = D3(f(g)) o Dg^3 + 3 * D2(f(g)) o Dg * D2g + D(f(g)) o D3g
+        
+        In the general case, the chain rule is:
+        D^n(f o g) = summation(k=0 to n-1) (n-1 choose k) * D^(k+1)g(x)D^(n-k)(f'(g(x)))
+
+        see https://math.stackexchange.com/questions/4046174/nth-derivative-with-chain-rule for more details. 
+        
+        """
+        
+        
+            
+        wx, wt = DX_arr[0], DX_arr[1] # shapes (B,C,T,X)
+
+        # X1 (B, X, T, C)
+        X1 = X1.permute(0, 3, 1, 2)  #
+        # now X1 (B, C, T, X)
+
+        b = X1.shape[0]
+        t = X1.shape[3]
+        x = X1.shape[2]
+        i = self.hidden_channels
+        m = 256 #self.x_res *4
+        n = 128 #self.x_res * 2#self.hidden_channels*2
+        #o = self.out_dim
+
+        ### Gradient: D(f o g) = D(f(g)) o Dg
+        DW1 = Q1.weight #(m, i)
+        Dtanh = 1/torch.cosh(X1)**2  # (b,m,x)
+        DW2 = Q2.weight.reshape(2*n,)  # (m, o)
+        DQ = torch.einsum("mi,bmtx,m->bitx", DW1, Dtanh, DW2)
+
+        wxQ = torch.einsum("bitx, bitx->btx", DQ, wx)
+        wtQ = torch.einsum("bitx, bitx->btx", DQ, wt)
+
+        ### Hessian: D^2(f o g) = Dg o Hf o Dg + Df o Hg
+
+        if self.x_second_deriv:
+            wxx = DX_arr[2]
+        if self.y_second_deriv:
+            wyy = DX_arr[3]
+
+        Htanh = -2*Dtanh*torch.tanh(X1)
+        H2 = DW2.reshape(1,m,1,1)*Htanh # (b,m,x,y,t)
+
+        if self.x_second_deriv:
+            wxx1 = torch.einsum("bitx,mi,bmtx,mj,bjtx->btx", wx,DW1,H2,DW1,wx) # (b,t,x)
+            wxx2 = torch.einsum("bitx,bitx->btx", DQ.reshape(b,i,t,x), wxx)
+            wxxQ = wxx1 + wxx2
+        
+        if self.y_second_deriv:
+            wyy1 = torch.einsum("bitx,mi,bmtx,mj,bjtx->btx", wy,DW1,H2,DW1,wy) # (b,t,y)
+            wyy2 = torch.einsum("bitx,bitx->btx", DQ.reshape(b,i,t,y), wyy)
+            wyyQ = wyy1 + wyy2
+
+        if self.x_second_deriv and self.y_second_deriv:
+            Dx_arr = (wxQ, wtQ, wxxQ, wyyQ)
+        elif self.x_second_deriv and not self.y_second_deriv:
+            Dx_arr = (wxQ, wtQ, wxxQ)
+        elif not self.x_second_deriv and self.y_second_deriv:
+            Dx_arr = (wxQ, wtQ, wyyQ)
+        else:
+            Dx_arr = (wxQ, wtQ)
+
+            
+        return Dx_arr
+
+    def forward(self, x, output_shape=None, **kwargs):
+            """FNO's forward pass
+            
+            1. Applies optional positional encoding
+
+            2. Sends inputs through a lifting layer to a high-dimensional latent space
+
+            3. Applies optional domain padding to high-dimensional intermediate function representation
+
+            4. Applies `n_layers` Fourier/FNO layers in sequence (SpectralConvolution + skip connections, nonlinearity) 
+
+            5. If domain padding was applied, domain padding is removed
+
+            6. Projection of intermediate function representation to the output channels
+
+            Parameters
+            ----------
+            x : tensor
+                input tensor
+            
+            output_shape : {tuple, tuple list, None}, default is None
+                Gives the option of specifying the exact output shape for odd shaped inputs.
+                
+                * If None, don't specify an output shape
+
+                * If tuple, specifies the output-shape of the **last** FNO Block
+
+                * If tuple list, specifies the exact output-shape of each FNO Block
+            """
+
+            if output_shape is None:
+                output_shape = [None]*self.n_layers
+            elif isinstance(output_shape, tuple):
+                output_shape = [None]*(self.n_layers - 1) + [output_shape]
+
+            # append spatial pos embedding if set
+            if self.positional_embedding is not None:
+                x = self.positional_embedding(x)
+            
+            x = self.lifting(x)
+
+            if self.FC_type == 'beginning':
+                x = self.FC_func(x)
+            
+            if self.domain_padding is not None:
+                x = self.domain_padding.pad(x)
+
+            for layer_idx in range(self.n_layers):
+                x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
+
+            if self.domain_padding is not None:
+                x = self.domain_padding.unpad(x)
+
+            
+            if self.FC_type == 'end':
+                x1 = self.FC_func(x)
+            elif self.FC_type == 'beginning':  
+                x1 = x 
+
+ 
+            if self.fourier_diff and (self.FC_type == 'end' or self.FC_type == 'beginning'):
+                dy = fourier_derivative_1d(x1, order = 1, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dx = fourier_derivative_1d(x1.permute(0, 1, 3, 2), order = 1, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dx = dx.permute(0, 1, 3, 2)
+                dyy = fourier_derivative_1d(x1, order = 2, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dxx = fourier_derivative_1d(x1.permute(0, 1, 3, 2), order = 2, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dxx = dxx.permute(0, 1, 3, 2)
+
+                #dx, dy, dxx, dyy = fourier_derivative_2d(x1, order = 1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, x_second_deriv = self.x_second_deriv, y_second_deriv = self.y_second_deriv)
+                if self.one_sided:
+                    dx = dx[..., :-self.cont_points, :-self.cont_points]
+                    dy = dy[..., :-self.cont_points, :-self.cont_points]
+                    if self.x_second_deriv:
+                        dxx = dxx[..., :-self.cont_points, :-self.cont_points]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., :-self.cont_points, :-self.cont_points]
+                else:
+                    dx = dx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    dy = dy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.x_second_deriv:
+                        dxx = dxx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+    
+                if self.x_second_deriv:
+                    Dx_arr = (dx, dy, dxx)
+                    #print(len(Dx_arr))
+                elif self.y_second_deriv:
+                    Dx_arr = (dx, dy, dyy)
+                elif self.x_second_deriv and self.y_second_deriv:
+                    Dx_arr = (dx, dy, dxx, dyy)
+                else:
+                    Dx_arr = (dx, dy)
+
+                Q1 = self.projection.fcs[0]  # first Linear layer
+                Q2 = self.projection.fcs[-1]
+
+        
+
+                if self.FC_type == 'beginning': 
+                    if self.one_sided:
+                        x1 = x[..., :-self.cont_points, :-self.cont_points,]
+                    else:
+                        x1 = x[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                if self.FC_type == 'end':
+                    x1 = x
+
+                # Reshape x1 to be compatible with Q1 while preserving orientation
+                b, c, h, w = x1.shape
+                x1_flat = x1.permute(0, 2, 3, 1)
+                X1 = Q1(x1_flat) 
+                Dx_arr = self.dQ_2D(X1, Dx_arr, self.x_second_deriv, self.y_second_deriv, Q1, Q2)
+
+                x = x.permute(0, 2, 3, 1) 
+                x = self.projection(x)  
+                x = x.permute(0, 3, 1, 2)
+                #print(x.shape)
+                
+
+                if self.FC_type == 'beginning':
+                    if self.one_sided:
+                        x = x[..., :-self.cont_points, :-self.cont_points]
+                    else:
+                        x = x[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                x = x.squeeze()
+                x = x.T
+            
+            if self.FC_type == 'outside':
+                x = x.permute(0, 2, 3, 1) 
+                x = self.projection(x)  
+                x = x.permute(0, 3, 1, 2)
+                #x = x.transpose(1, 2)
+                x1 = self.FC_func(x)
+                dy = fourier_derivative_1d(x1, order = 1, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dx = fourier_derivative_1d(x1.permute(0, 1, 3, 2), order = 1, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dx = dx.permute(0, 1, 3, 2)
+                dxx = fourier_derivative_1d(x1.permute(0, 1, 3, 2), order = 2, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dxx = dxx.permute(0, 1, 3, 2)
+                dyy = fourier_derivative_1d(x1, order = 2, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dyy = dyy
+
+                #dx, dy, dxx, dyy = fourier_derivative_2d(x1, order = 1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, x_second_deriv = self.x_second_deriv, y_second_deriv = self.y_second_deriv)
+                if self.one_sided:
+                    dx = dx[..., :-self.cont_points, :-self.cont_points]
+                    dy = dy[..., :-self.cont_points, :-self.cont_points]
+                    if self.x_second_deriv:
+                        dxx = dxx[..., :-self.cont_points, :-self.cont_points]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., :-self.cont_points, :-self.cont_points]
+                else:
+                    dx = dx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    dy = dy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.x_second_deriv:
+                        dxx = dxx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+    
+                if self.x_second_deriv:
+                    Dx_arr = (dx, dy, dxx)
+                    #print(len(Dx_arr))
+                elif self.y_second_deriv:
+                    Dx_arr = (dx, dy, dyy)
+                elif self.x_second_deriv and self.y_second_deriv:
+                    Dx_arr = (dx, dy, dxx, dyy)
+                else:
+                    Dx_arr = (dx, dy)
+                
+                Dx_arr = (Dx_arr[0].squeeze(), *[deriv.squeeze() for deriv in Dx_arr[1:]])
+                x = x.squeeze()
+                x = x.T
+                
+
+            
+            #print(x.shape)
+            return x.squeeze(), Dx_arr #[0].squeeze(), *[deriv.squeeze() for deriv in Dx_arr[1:]]
+
+class FC_FNO3d(FNO):
+    """3D FC-FNO. As implemented, the FC_FNO3d works for the 2D + time Navier-Stokes equation. 
+
+
+    ** THERE ARE UN NEEDED PARAMETERS IN THIS CLASS. WILL BE FIXED IN THE FUTURE. **
+    
+    Will be generalized to other PDEs in the future.
+
+    For the full list of parameters, see :class:`neuralop.models.FNO`.
+
+    Parameters
+    ----------
+    modes_width : int
+        number of modes to keep in Fourier Layer, along the width
+    modes_height : int
+        number of Fourier modes to keep along the height
+    modes_depth : int
+        number of Fourier modes to keep along the depth
+    FC_type: str
+        'beginning': FC is applied before the inital lifiting layer. 
+        'end': FC is applied right before the last projection layer using the multivariable chain rule. This is just a means to compute derivatives.
+        'outside': FC is applied after the last projection layer. This is again just a means to compute derivatives.
+    FC_func: function
+        FC function to apply. Assumes it extends the function in 3D
+    cont_points: int
+        number of points to use for the continuous part of the domain.
+    laplacian: bool
+        whether to compute the Laplacian.
+    x_second_deriv: bool
+        whether to compute the second derivative along the x-direction.
+    y_second_deriv: bool
+        whether to compute the second derivative along the y-direction.
+    z_second_deriv: bool
+        whether to compute the second derivative along the z-direction.
+    gradient: bool
+        whether to compute the gradient.
+    x_res: int
+        number of grid points along the x-direction.
+    y_res: int
+        number of grid points along the y-direction.
+    z_res: int  
+        number of grid points along the z-direction.
+    """
+
+    def __init__(
+        self,
+        n_modes_height,
+        n_modes_width,
+        n_modes_depth,
+        hidden_channels,
+        in_channels=3,
+        out_channels=1,
+        lifting_channels=256,
+        projection_channels=256,
+        n_layers=4,
+        resolution_scaling_factor=None,
+        max_n_modes=None,
+        non_linearity=F.gelu,
+        Lx = int,
+        Ly = int,
+        Lz = int,
+        x_deriv = None,
+        y_deriv = None,
+        z_deriv = None,
+        x_second_deriv = None,
+        y_second_deriv = None,
+        z_second_deriv = None,
+        gradient = None, 
+        laplacian = None,   
+        x_res = None,
+        y_res = None,
+        z_res = None,
+        FC_func=None,
+        FC_type = None,
+        cont_points = None,
+        one_sided = None,
+        fourier_diff = None,
+        stabilizer=None,
+        complex_data=False,
+        fno_block_precision="full",
+        channel_mlp_dropout=0,
+        channel_mlp_expansion=0.5,
+        norm=None,
+        skip="soft-gating",
+        separable=False,
+        preactivation=False,
+        factorization=None,
+        rank=1.0,
+        fixed_rank_modes=False,
+        implementation="factorized",
+        decomposition_kwargs=dict(),
+        domain_padding=None,
+        domain_padding_mode="symmetric",
+        **kwargs
+    ):
+        super().__init__(
+            n_modes=(n_modes_height, n_modes_width, n_modes_depth),
+            hidden_channels=hidden_channels,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            lifting_channels=lifting_channels,
+            projection_channels=projection_channels,
+            n_layers=n_layers,
+            resolution_scaling_factor=resolution_scaling_factor,
+            non_linearity=non_linearity,
+            stabilizer=stabilizer,
+            complex_data=complex_data,
+            fno_block_precision=fno_block_precision,
+            max_n_modes=max_n_modes,
+            channel_mlp_dropout=channel_mlp_dropout,
+            channel_mlp_expansion=channel_mlp_expansion,
+            norm=norm,
+            skip=skip,
+            separable=separable,
+            preactivation=preactivation,
+            factorization=factorization,
+            rank=rank,
+            fixed_rank_modes=fixed_rank_modes,
+            implementation=implementation,
+            decomposition_kwargs=decomposition_kwargs,
+            domain_padding=domain_padding,
+            domain_padding_mode=domain_padding_mode,
+            FC_func=FC_func,
+            FC_type=FC_type,
+            cont_points=cont_points,
+            one_sided=one_sided,
+            fourier_diff=fourier_diff,
+            x_deriv=x_deriv,
+            y_deriv=y_deriv,
+            z_deriv=z_deriv,
+            x_second_deriv=x_second_deriv,
+            y_second_deriv=y_second_deriv,
+            z_second_deriv=z_second_deriv,
+            gradient=gradient,
+            x_res=x_res,
+            y_res=y_res,
+            z_res=z_res,
+            laplacian=laplacian,
+        )
+        self.n_modes_height = n_modes_height
+        self.n_modes_width = n_modes_width
+        self.n_modes_depth = n_modes_depth
+        self.Lx = Lx
+        self.Ly = Ly
+        self.Lz = Lz
+        self.FC_func = FC_func
+        self.FC_type = FC_type
+        self.cont_points = cont_points
+        self.one_sided = one_sided
+        self.fourier_diff = fourier_diff
+        self.x_deriv = x_deriv
+        self.y_deriv = y_deriv
+        self.z_deriv = z_deriv
+        self.x_second_deriv = x_second_deriv
+        self.y_second_deriv = y_second_deriv
+        self.z_second_deriv = z_second_deriv
+        self.gradient = gradient
+        self.x_res = x_res
+        self.y_res = y_res
+        self.z_res = z_res
+        self.laplacian = laplacian
+        self.projection = LinearChannelMLP(
+            layers=[hidden_channels, projection_channels, out_channels],
+            non_linearity=non_linearity,)
+
+    def dQ_3D(self, X1, DX_arr, laplacian, x_second_deriv, y_second_deriv, Q1, Q2):
+
+        """
+        Chain rule of model, call it Q, to compute dQ/d(inputs). Uses einsum for efficiency. 
+
+        ***** Assumes that the final nonlinearity is tanh. ******
+        
+        Gradient chain rule: D(f o g) = D(f(g)) o Dg
+        
+        Hessian chain rule: D2(f o g) = D2(f(g)) o Dg^2 + D(f(g)) o D2g
+
+        As implemented, Q1 is the first projection layer of the model, and Q2 is the last projection layer.         
+        
+        Also as implemented, this works for the Navier-Stokes 2D + time case.
+        In future, this will be generalized and more robust for any PDE
+
+        You can generalize this to higher dimensions by using the chain rule for higher derivatives. 
+      
+        In the 3rd derivative case, the  chain rule is:
+        D3(f o g) = D3(f(g)) o Dg^3 + 3 * D2(f(g)) o Dg * D2g + D(f(g)) o D3g
+        
+        In the general case, the chain rule is:
+        D^n(f o g) = summation(k=0 to n-1) (n-1 choose k) * D^(k+1)g(x)D^(n-k)(f'(g(x)))
+
+        see https://math.stackexchange.com/questions/4046174/nth-derivative-with-chain-rule for more details. 
+        
+        """
+
+        # DX_arr = (dx, dy, dt)
+        # second_derivs = (dxx, dyy)
+        dx, dy, dt = DX_arr
+        dxx, dyy   = laplacian      # (b,i,t,x,z)
+
+        # Put channels first: (B,C,T,X,Z)
+        X1 = X1.permute(0,4,1,2,3)
+        B, C, T, X, Z = X1.shape
+        I = self.hidden_channels
+        O = self.out_channels
+
+
+        DW1 = Q1.weight           
+        DW2 = Q2.weight.t()            # (C_in, O)
+
+        Dtanh = 1/torch.cosh(X1)**2           # (B,C,T,X,Z)
+
+        # First-order term J_f(g(x))*J_g(x)
+        
+        DQ   = torch.einsum(
+            "ci, bctxz, co -> boitxz",
+            DW1, Dtanh, DW2
+        )      # (B,O,I,T,X,Z)
+
+        wxQ = torch.einsum("boitxz,bitxz->botxz", DQ, dx)
+        wzQ = torch.einsum("boitxz,bitxz->botxz", DQ, dy)
+        wtQ = torch.einsum("boitxz,bitxz->botxz", DQ, dt)
+
+        # Hessian term J_g^T * H_f * J_g  +  J_f * H_g
+        Htanh = -2*Dtanh*torch.tanh(X1)                         # (B,C,T,X,Z)
+        H2    = torch.einsum("co,bctxz->bcotxz", DW2, Htanh)    # (B,C,O,T,X,Z)
+
+        wxx1  = torch.einsum("bitxz,ci,bcotxz,cj,bjtxz->botxz",
+                            dx, DW1, H2, DW1, dx)
+        wxx2  = torch.einsum("boitxz,bitxz->botxz", DQ, dxx)
+        wxxQ  = wxx1 + wxx2
+
+        wzz1  = torch.einsum("bitxz,ci,bcotxz,cj,bjtxz->botxz",
+                            dy, DW1, H2, DW1, dy)
+        wzz2  = torch.einsum("boitxz,bitxz->botxz", DQ, dyy)
+        wzzQ  = wzz1 + wzz2
+
+        DX_out       = (wxQ, wzQ, wtQ)
+        laplacian_out = (wxxQ, wzzQ)
+        return DX_out, laplacian_out
+
+
+    def forward(self, x, output_shape=None, **kwargs):
+            """FNO's forward pass
+            
+            1. Applies optional positional encoding
+
+            2. Sends inputs through a lifting layer to a high-dimensional latent space
+
+            3. Applies optional domain padding to high-dimensional intermediate function representation
+
+            4. Applies `n_layers` Fourier/FNO layers in sequence (SpectralConvolution + skip connections, nonlinearity) 
+
+            5. If domain padding was applied, domain padding is removed
+
+            6. Projection of intermediate function representation to the output channels
+
+            Parameters
+            ----------
+            x : tensor
+                input tensor
+            
+            output_shape : {tuple, tuple list, None}, default is None
+                Gives the option of specifying the exact output shape for odd shaped inputs.
+                
+                * If None, don't specify an output shape
+
+                * If tuple, specifies the output-shape of the **last** FNO Block
+
+                * If tuple list, specifies the exact output-shape of each FNO Block
+            """
+
+            if output_shape is None:
+                output_shape = [None]*self.n_layers
+            elif isinstance(output_shape, tuple):
+                output_shape = [None]*(self.n_layers - 1) + [output_shape]
+
+            # append spatial pos embedding if set
+            if self.positional_embedding is not None:
+                x = self.positional_embedding(x)
+            
+            x = self.lifting(x)
+
+            if self.FC_type == 'beginning':
+                x = self.FC_func(x)
+            
+            if self.domain_padding is not None:
+                x = self.domain_padding.pad(x)
+
+            for layer_idx in range(self.n_layers):
+                x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
+
+            if self.domain_padding is not None:
+                x = self.domain_padding.unpad(x)
+
+            
+            if self.FC_type == 'end':
+                x1 = self.FC_func(x)
+                #x1 = self.FC_func(x, 2, 3)
+                #x1 = self.FC_func(x1, 3, 3)
+            elif self.FC_type == 'beginning':
+                x1 = x #(b, c, x, y, z) 
+
+            
+            if self.fourier_diff and (self.FC_type == 'end' or self.FC_type == 'beginning'):
+                dz = fourier_derivative_1d(x1, order = 1, L = self.Lz * (self.z_res+self.cont_points)/self.z_res)
+                dy = fourier_derivative_1d(x1.permute(0, 1, 2, 4, 3), order = 1, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dy = dy.permute(0, 1, 2, 4, 3)
+                dx = fourier_derivative_1d(x1.permute(0, 1, 3, 4, 2), order = 1, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dx = dx.permute(0, 1, 4, 2, 3)
+                dxx = fourier_derivative_1d(x1.permute(0, 1, 3, 4, 2), order = 2, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dxx = dxx.permute(0, 1, 4, 2, 3)
+                dyy = fourier_derivative_1d(x1.permute(0, 1, 2, 4, 3), order = 2, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dyy = dyy.permute(0, 1, 2, 4, 3)
+                if self.gradient:
+                    gradient = gradient_3D(x1, order = 1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, Lz = self.Lz * (self.z_res+self.cont_points)/self.z_res)
+                if self.laplacian:
+                    laplacian_arr = (dxx, dyy)
+
+                #dx, dy, dxx, dyy = fourier_derivative_2d(x1, order = 1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, x_second_deriv = self.x_second_deriv, y_second_deriv = self.y_second_deriv)
+                if self.one_sided:
+                    dx = dx[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    dy = dy[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    dz = dz[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    #print("dx.shape", dx.shape)
+                    #print('dy.shape', dy.shape)
+                    #print('dz.shape', dz.shape)
+                    if self.x_second_deriv:
+                        dxx = dxx[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.z_second_deriv:
+                        dzz = dzz[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.gradient:
+                        gradient = gradient[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.laplacian:
+                        lap_list = []
+                        for i in laplacian_arr:
+                            lap_list.append(i[..., :-self.cont_points, :-self.cont_points, :-self.cont_points])
+                        laplacian = lap_list
+                else:
+                    dx = dx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    dy = dy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    dz = dz[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.x_second_deriv:
+                        dxx = dxx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.z_second_deriv:
+                        dzz = dzz[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.gradient:
+                        gradient = gradient[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.laplacian:
+                        dxx = dxx[..., -self.cont_points, -self.cont_points, -self.cont_points]
+                        dyy = dyy[..., -self.cont_points, -self.cont_points, -self.cont_points]
+                        laplacian = (dxx, dyy)
+                        #dzz = dzz[..., -self.cont_points, -self.cont_points, -self.cont_points]
+                        #laplacian = laplacian_3D(x1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, Lz = self.Lz * (self.z_res+self.cont_points)/self.z_res, spatial = True)
+                Dx_arr = (dx, dy, dz)
+                if self.x_second_deriv:
+                    Dx_arr = Dx_arr.append(dxx)
+                if self.y_second_deriv:
+                    Dx_arr.append(dyy)
+                if self.z_second_deriv:
+                    Dx_arr.append(dzz)
+
+
+                Q1 = self.projection.fcs[0]  # first Linear layer
+                Q2 = self.projection.fcs[-1]
+
+                if self.FC_type == 'beginning': 
+                    if self.one_sided:
+                        x1 = x[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    else:
+                        x1 = x[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                if self.FC_type == 'end':
+                    x1 = x
+
+                #if self.fourier_diff:
+                #    x1 = x
+                #else:
+                #    x1 = x 
+
+                b, c, h, w, d = x1.shape
+                x1_flat = x1.permute(0, 2, 3, 4, 1)
+                X1 = Q1(x1_flat) 
+                #for i in Dx_arr:
+                #    print("i.shape", i.shape)
+                Dx_arr, laplacian = self.dQ_3D(X1, Dx_arr, laplacian, self.x_second_deriv, self.y_second_deriv, Q1, Q2)
+                #laplacian = laplacian[0] + laplacian[1]
+                #gradient = self.dQ_3D(X1, gradient, self.x_second_deriv=False, self.y_second_deriv=False, self.z_second_deriv=False, Q1, Q2)
+
+                x = x.permute(0, 2, 3, 4, 1) 
+                x = self.projection(x)  
+                x = x.permute(0, 4, 1, 2, 3)
+            
+
+                if self.FC_type == 'beginning':
+                    if self.one_sided:
+                        x = x[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    else:
+                        x = x[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+            
+            if self.FC_type == 'outside':
+                # Reshape x for projection: [b, c, h, w] -> [b, h*w, c]
+                x = x.permute(0, 2, 3, 4, 1) # .reshape(b, h*w, c)
+                x = self.projection(x)  # Apply projection
+                x = x.permute(0, 4, 1, 2, 3)
+                x1 = self.FC_func(x)
+                dz = fourier_derivative_1d(x1, order = 1, L = self.Lz * (self.z_res+self.cont_points)/self.z_res)
+                dy = fourier_derivative_1d(x1.permute(0, 1, 2, 4, 3), order = 1, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dy = dy.permute(0, 1, 2, 4, 3)
+                dx = fourier_derivative_1d(x1.permute(0, 1, 3, 4, 2), order = 1, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dx = dx.permute(0, 1, 4, 2, 3)
+                dxx = fourier_derivative_1d(x1.permute(0, 1, 3, 4, 2), order = 2, L = self.Lx * (self.x_res+self.cont_points)/self.x_res)
+                dxx = dxx.permute(0, 1, 4, 2, 3)
+                dyy = fourier_derivative_1d(x1.permute(0, 1, 2, 4, 3), order = 2, L = self.Ly * (self.y_res+self.cont_points)/self.y_res)
+                dyy = dyy.permute(0, 1, 2, 4, 3)
+                if self.gradient:
+                    gradient = gradient_3D(x1, order = 1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, Lz = self.Lz * (self.z_res+self.cont_points)/self.z_res)
+                if self.laplacian:
+                    laplacian = laplacian_3D(x1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, Lz = self.Lz * (self.z_res+self.cont_points)/self.z_res)
+
+                #dx, dy, dxx, dyy = fourier_derivative_2d(x1, order = 1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, x_second_deriv = self.x_second_deriv, y_second_deriv = self.y_second_deriv)
+                if self.one_sided:
+                    dx = dx[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    dy = dy[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    dz = dz[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.x_second_deriv:
+                        dxx = dxx[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.z_second_deriv:
+                        dzz = dzz[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.gradient:
+                        gradient = gradient[..., :-self.cont_points, :-self.cont_points, :-self.cont_points]
+                    if self.laplacian:
+                        lap_list = []
+                        for i in laplacian:
+                            lap_list.append(i[..., :-self.cont_points, :-self.cont_points, :-self.cont_points])
+                        laplacian = lap_list
+                        #laplacian = lap_list[0] + lap_list[1]
+                else:
+                    dx = dx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    dy = dy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    dz = dz[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.x_second_deriv:
+                        dxx = dxx[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.y_second_deriv:
+                        dyy = dyy[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.z_second_deriv:
+                        dzz = dzz[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.gradient:
+                        gradient = gradient[..., self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2, self.cont_points//2:-self.cont_points//2]
+                    if self.laplacian:
+                        laplacian_arr = laplacian_3D(x1, Lx = self.Lx * (self.x_res+self.cont_points)/self.x_res, Ly = self.Ly * (self.y_res+self.cont_points)/self.y_res, Lz = self.Lz * (self.z_res+self.cont_points)/self.z_res, spatial = True)
+                        #laplacian = laplacian_arr[0] + laplacian_arr[1]
+                Dx_arr = (dx, dy, dz)
+          
+
+            if self.gradient and self.laplacian:
+                return x, Dx_arr, gradient, laplacian
+            elif self.gradient:
+                return x, Dx_arr, gradient
+            elif self.laplacian:
+                #print("laplacian.shape", laplacian.shape)
+                #print("x.shape", x.shape)
+                return x, Dx_arr, laplacian
+            else:
+                return x, Dx_arr
 
 class FNO1d(FNO):
     """1D Fourier Neural Operator
@@ -910,3 +1979,5 @@ TFNO = partialclass("TFNO", FNO, factorization="Tucker")
 TFNO1d = partialclass("TFNO1d", FNO1d, factorization="Tucker")
 TFNO2d = partialclass("TFNO2d", FNO2d, factorization="Tucker")
 TFNO3d = partialclass("TFNO3d", FNO3d, factorization="Tucker")
+
+
